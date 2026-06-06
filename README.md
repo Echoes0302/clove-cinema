@@ -2,7 +2,7 @@
 
 > 极简放映室后端 — 给"我和我的 AI 一起看电影"用的。
 >
-> 扫文件夹列片，HTTP Range 流，SRT 字幕按区间增量返回。**没有上传、没有抽帧、不依赖 ffmpeg。**
+> 扫文件夹列片，HTTP Range 流，SRT/VTT/ASS/SSA 字幕按区间增量返回（自动编码探测：UTF-8/UTF-16/GBK）。**没有上传、没有抽帧、不依赖 ffmpeg。**
 > 截图给 AI 看当前画面这步由你自己的前端 canvas 实时抓，本服务不参与。
 
 ## 适用场景
@@ -64,7 +64,7 @@ CLOVE_CINEMA_ALLOW_ORIGIN=https://your.site  # 跨域时设；同源不用
 ~/cinema/
 ├── 源代码（2011）/
 │   ├── source-code.mp4         # 任意文件名，取扫到的第一个视频
-│   └── source-code.zh.srt      # 任意文件名，取第一个 .srt（可无字幕）
+│   └── source-code.zh.ass      # 任意文件名，取第一个字幕（.srt/.vtt/.ass/.ssa，可无）
 └── Hereditary (2018)/
     ├── hereditary.mp4
     └── hereditary.srt
@@ -137,7 +137,7 @@ web.run_app(app)
 **反复点开关停后卡住** — aiohttp 在客户端中途断开 Range 流时可能留下半死连接。
 服务里已经加了 `ConnectionResetError` 兜底，但极端场景可能还是卡。这时重启服务就好。
 
-**字幕乱码** — `.srt` 不是 UTF-8 编码。用 `iconv` 转一下：
+**字幕乱码** — 服务端已自动探测 UTF-8/UTF-16/GBK 编码，常见中文字幕开箱即用。仍然乱码的话用 `iconv` 转一下：
 ```bash
 iconv -f GBK -t UTF-8 input.srt > output.srt
 ```

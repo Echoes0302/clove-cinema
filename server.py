@@ -39,6 +39,15 @@ _VIDEO_MIME = {
 # SRT 时间戳：00:01:02,500 或 00:01:02.500
 _TS_RE = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})")
 
+# 字幕文件支持的扩展名（按目录内字母序取第一个命中的）
+SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa")
+
+# VTT 短时间戳：01:02.500（分:秒.毫秒，无小时段）
+_TS_VTT_SHORT_RE = re.compile(r"(\d{1,2}):(\d{2})\.(\d{1,3})")
+
+# ASS 覆盖标签 {\pos(1,2)} {\fad(...)} 等
+_ASS_TAG_RE = re.compile(r"\{[^}]*\}")
+
 
 # ---------- helpers ----------
 
@@ -93,6 +102,108 @@ def parse_srt(text: str):
     return cues
 
 
+def parse_vtt(text: str):
+    """容错 WebVTT 解析 → 同 parse_srt 结构。
+    处理 WEBVTT 头、NOTE/STYLE/REGION 块、cue setting、<c>/<i> 标签、短时间戳。"""
+    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    cues = []
+    for block in re.split(r"\n[ \t]*\n", text.strip()):
+        lines = block.split("\n")
+        if lines and re.match(r"^(WEBVTT|NOTE|STYLE|REGION)\b", lines[0].strip(), re.I):
+            continue
+        ts_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if ts_idx is None:
+            continue
+        ts_line = lines[ts_idx]
+        stamps = _TS_RE.findall(ts_line)
+        if len(stamps) >= 2:
+            start, end = _ts_to_sec(*stamps[0]), _ts_to_sec(*stamps[1])
+        else:
+            shorts = _TS_VTT_SHORT_RE.findall(ts_line)
+            if len(shorts) < 2:
+                continue
+            start = int(shorts[0][0]) * 60 + int(shorts[0][1]) + int(shorts[0][2].ljust(3, "0")) / 1000.0
+            end = int(shorts[1][0]) * 60 + int(shorts[1][1]) + int(shorts[1][2].ljust(3, "0")) / 1000.0
+        body = "\n".join(lines[ts_idx + 1:]).strip()
+        body = re.sub(r"<[^>]+>", "", body).strip()
+        if not body:
+            continue
+        cues.append({"start": start, "end": end, "text": body})
+    cues.sort(key=lambda c: c["start"])
+    return cues
+
+
+def _ass_ts_to_sec(raw: str):
+    """ASS 时间戳 H:MM:SS.cc（厘秒）→ 秒；不合法返回 None。"""
+    m = re.match(r"(\d+):(\d{2}):(\d{2})[.:](\d{1,3})", raw.strip())
+    if not m:
+        return None
+    h, mm, ss, frac = m.groups()
+    return int(h) * 3600 + int(mm) * 60 + int(ss) + int(frac.ljust(3, "0")) / 1000.0
+
+
+def parse_ass(text: str):
+    """容错 ASS/SSA 解析：取 Dialogue 行，Format 行动态定字段位，
+    清洗 {\\tags}、\\N 换行、\\h 空格。"""
+    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    start_i, end_i, text_i, n_fields = 1, 2, 9, 10  # v4+ 标准缺省
+    cues = []
+    for line in text.split("\n"):
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("format:"):
+            fields = [f.strip().lower() for f in s.split(":", 1)[1].split(",")]
+            if "start" in fields and "end" in fields:  # 排除 [Styles] 段的 Format
+                start_i, end_i = fields.index("start"), fields.index("end")
+                text_i = fields.index("text") if "text" in fields else len(fields) - 1
+                n_fields = len(fields)
+            continue
+        if not low.startswith("dialogue:"):
+            continue
+        parts = s.split(":", 1)[1].lstrip().split(",", n_fields - 1)
+        if len(parts) <= max(start_i, end_i, text_i):
+            continue
+        start, end = _ass_ts_to_sec(parts[start_i]), _ass_ts_to_sec(parts[end_i])
+        if start is None or end is None:
+            continue
+        body = _ASS_TAG_RE.sub("", parts[text_i])
+        body = body.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ").strip()
+        if not body:
+            continue
+        cues.append({"start": start, "end": end, "text": body})
+    cues.sort(key=lambda c: c["start"])
+    return cues
+
+
+def _read_sub_text(path: Path) -> str:
+    """字幕文件读取 + 编码探测：UTF-16(仅认 BOM) → UTF-8(BOM) → GB18030 → 宽容 UTF-8。
+    中文字幕组的 .ass 常见 GBK/UTF-16。UTF-16 必须只认 BOM——
+    无 BOM 的 GBK 文件长度为偶数时也能被 utf-16 "成功"解码成乱码。"""
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeError:
+            pass
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return raw.decode("utf-8", "ignore")
+
+
+def parse_subtitles(path: Path):
+    """统一入口：按扩展名分发到对应解析器。"""
+    text = _read_sub_text(path)
+    ext = path.suffix.lower()
+    if ext == ".vtt":
+        return parse_vtt(text)
+    if ext in (".ass", ".ssa"):
+        return parse_ass(text)
+    return parse_srt(text)
+
+
 def _first_match(d: Path, exts):
     for p in sorted(d.iterdir()):
         if p.is_file() and p.suffix.lower() in exts:
@@ -107,15 +218,15 @@ def _resolve(root: Path, cid: str):
     d = root / cid
     if not d.is_dir():
         return None
-    return d, _first_match(d, VIDEO_EXTS), _first_match(d, (".srt",))
+    return d, _first_match(d, VIDEO_EXTS), _first_match(d, SUB_EXTS)
 
 
 def _film_info(d: Path):
     video = _first_match(d, VIDEO_EXTS)
     if not video:
         return None
-    srt = _first_match(d, (".srt",))
-    cues = parse_srt(srt.read_text("utf-8", "ignore")) if srt else []
+    srt = _first_match(d, SUB_EXTS)
+    cues = parse_subtitles(srt) if srt else []
     return {
         "id": d.name,
         "title": d.name,
@@ -179,7 +290,7 @@ def _make_handlers(root: Path, allow_origin: str):
         if not r:
             return _err("not found", 404, allow_origin=allow_origin)
         srt = r[2]
-        cues = parse_srt(srt.read_text("utf-8", "ignore")) if srt else []
+        cues = parse_subtitles(srt) if srt else []
         try:
             frm = float(request.query.get("from", "0"))
             to = float(request.query.get("to", "0"))
